@@ -158,19 +158,49 @@ module Vernier
 
       def enable
         require "active_support"
+        collector = @collector
+
+        # For sql.active_record: use an evented subscriber so we can capture
+        # the call stack in `start` (before SQL executes) rather than `finish`
+        # (after the stack has unwound).
+        sql_subscriber = Object.new
+        sql_subscriber.instance_variable_set(:@collector, collector)
+        sql_subscriber.instance_variable_set(:@pending, {})
+        sql_subscriber.define_singleton_method(:start) do |name, id, _payload|
+          @pending[id] = [
+            Process.clock_gettime(Process::CLOCK_MONOTONIC),
+            @collector.stack_table.current_stack
+          ]
+        end
+        sql_subscriber.define_singleton_method(:finish) do |name, id, payload|
+          start_time, stack_idx = @pending.delete(id)
+          return unless start_time
+          finish_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          data = { type: name }
+          if keys = SERIALIZED_KEYS[name]
+            keys.each { |key| data[key] = payload[key] }
+          end
+          data[:cause] = { stack: stack_idx } if stack_idx
+          @collector.add_marker(
+            name: name,
+            start: (start_time * 1_000_000_000.0).to_i,
+            finish: (finish_time * 1_000_000_000.0).to_i,
+            data: data
+          )
+        end
+        @sql_subscription = ::ActiveSupport::Notifications.subscribe("sql.active_record", sql_subscriber)
+
+        # Everything else: block subscriber (no stack capture needed)
         @subscription = ::ActiveSupport::Notifications.monotonic_subscribe(/\A[^!]/) do |name, start, finish, id, payload|
-          # Notifications.publish API may reach here without proper timing information included
+          next if name == "sql.active_record"
           unless Float === start && Float === finish
             next
           end
-
           data = { type: name }
           if keys = SERIALIZED_KEYS[name]
-            keys.each do |key|
-              data[key] = payload[key]
-            end
+            keys.each { |key| data[key] = payload[key] }
           end
-          @collector.add_marker(
+          collector.add_marker(
             name: name,
             start: (start * 1_000_000_000.0).to_i,
             finish: (finish * 1_000_000_000.0).to_i,
@@ -181,7 +211,9 @@ module Vernier
 
       def disable
         ::ActiveSupport::Notifications.unsubscribe(@subscription)
+        ::ActiveSupport::Notifications.unsubscribe(@sql_subscription)
         @subscription = nil
+        @sql_subscription = nil
       end
 
       def firefox_marker_schema
