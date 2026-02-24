@@ -156,31 +156,59 @@ module Vernier
         @collector = collector
       end
 
+      # Paths to exclude from caller frames — gem/vendor/framework internals.
+      # Everything else is kept. The consumer (e.g. querymap) applies further
+      # app-vs-infrastructure filtering.
+      EXCLUDED_PATH_RE = Regexp.union(
+        /\bgem:/,                       # bundled gems (gem:activerecord-8.0:...)
+        /\bvendor\//,                   # vendored gems
+        /\/<internal:/,                 # Ruby internals
+        /\A<internal:/,
+        /\A\(eval/,                     # eval'd code
+        /\A<cfunc>/,                    # C functions
+        /\bactive_support\/notifications/,  # AS::Notifications dispatch
+        /\bactive_support\/subscriber/,
+        /\bactive_support\/callbacks/,
+        /\bvernier\//,                  # Vernier itself
+      ).freeze
+
       def enable
         require "active_support"
         collector = @collector
 
         # For sql.active_record: use an evented subscriber so we can capture
         # the call stack in `start` (before SQL executes) rather than `finish`
-        # (after the stack has unwound).
+        # (after the stack has unwound). Uses caller_locations for accurate
+        # backtraces (rb_profile_frames/current_stack returns stale cfp entries
+        # in deep stacks).
         sql_subscriber = Object.new
         sql_subscriber.instance_variable_set(:@collector, collector)
         sql_subscriber.instance_variable_set(:@pending, {})
         sql_subscriber.define_singleton_method(:start) do |name, id, _payload|
+          locs = Kernel.caller_locations(2, 50)
+          caller_frames = []
+          locs&.each do |loc|
+            path = loc.absolute_path || loc.path || ""
+            next if EXCLUDED_PATH_RE.match?(path)
+            # Use relative path if under working directory
+            rel = path
+            caller_frames << "#{loc.label}  [#{rel}:#{loc.lineno}]"
+            break if caller_frames.size >= 8
+          end
           @pending[id] = [
             Process.clock_gettime(Process::CLOCK_MONOTONIC),
-            @collector.stack_table.current_stack
+            caller_frames
           ]
         end
         sql_subscriber.define_singleton_method(:finish) do |name, id, payload|
-          start_time, stack_idx = @pending.delete(id)
+          start_time, caller_frames = @pending.delete(id)
           return unless start_time
           finish_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           data = { type: name }
           if keys = SERIALIZED_KEYS[name]
             keys.each { |key| data[key] = payload[key] }
           end
-          data[:cause] = { stack: stack_idx } if stack_idx
+          data[:caller] = caller_frames if caller_frames && !caller_frames.empty?
           @collector.add_marker(
             name: name,
             start: (start_time * 1_000_000_000.0).to_i,

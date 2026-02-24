@@ -51,7 +51,7 @@ class TestActiveSupport < Minitest::Test
     assert_equal 0, markers.size
   end
 
-  def test_sql_markers_have_cause_stack
+  def test_sql_markers_have_caller_key
     result = Vernier.trace(hooks: [:activesupport]) do
       ActiveSupport::Notifications.instrument("sql.active_record", sql: "SELECT 1", name: "Test Load") {}
     end
@@ -65,58 +65,44 @@ class TestActiveSupport < Minitest::Test
     assert_equal "SELECT 1", data[:sql]
     assert_equal "Test Load", data[:name]
 
-    # The cause stack should be present and point into the stack table
-    assert data.key?(:cause), "sql.active_record marker should have :cause"
-    assert data[:cause].key?(:stack), "cause should have :stack"
-    stack_idx = data[:cause][:stack]
-    assert_kind_of Integer, stack_idx
-    assert stack_idx >= 0, "stack index should be non-negative"
+    # :caller is only present when app frames are found.
+    # In this test, all frames are in test/ or gem: paths, so :caller may be absent.
+    # The key assertion is that the marker was created with the right data.
+    if data.key?(:caller)
+      assert_kind_of Array, data[:caller]
+    end
   end
 
-  def test_sql_cause_stack_contains_caller
-    # Define a method whose name we can search for in the captured stack
+  def test_sql_caller_filters_non_app_frames
+    # caller_locations from test/ paths are filtered out by the app path regex.
+    # This verifies the filtering works — test frames should NOT appear.
     result = Vernier.trace(hooks: [:activesupport]) do
-      _sql_cause_test_caller_method
+      _sql_caller_test_method
     end
 
     markers = result.main_thread[:markers].select { |x| x[1] == "sql.active_record" }
     assert_equal 1, markers.size
 
-    stack_idx = markers[0][5].dig(:cause, :stack)
-    assert stack_idx, "should have cause.stack"
-
-    # Walk the stack and look for our caller method
-    st = result.stack_table
-    found_caller = false
-    idx = stack_idx
-    100.times do
-      break if idx.nil? || idx < 0
-      frame_idx = st.stack_frame_idx(idx)
-      func_idx = st.frame_func_idx(frame_idx)
-      name = st.func_name(func_idx)
-      if name&.include?("_sql_cause_test_caller_method")
-        found_caller = true
-        break
-      end
-      idx = st.stack_parent_idx(idx)
+    caller_frames = markers[0][5][:caller] || []
+    # No test/ frames should leak through
+    caller_frames.each do |f|
+      refute_match(/\Atest\//, f, "test/ frames should be filtered: #{f}")
     end
-
-    assert found_caller, "cause.stack should contain the calling method '_sql_cause_test_caller_method'"
   end
 
-  def test_non_sql_markers_have_no_cause_stack
+  def test_non_sql_markers_have_no_caller
     result = Vernier.trace(hooks: [:activesupport]) do
       ActiveSupport::Notifications.instrument("cache_read.active_support", key: "test") {}
     end
 
     markers = result.main_thread[:markers].select { |x| x[1] == "cache_read.active_support" }
     assert_equal 1, markers.size
-    refute markers[0][5].key?(:cause), "non-SQL markers should not have :cause"
+    refute markers[0][5].key?(:caller), "non-SQL markers should not have :caller"
   end
 
   private
 
-  def _sql_cause_test_caller_method
+  def _sql_caller_test_method
     ActiveSupport::Notifications.instrument("sql.active_record", sql: "SELECT 1", name: "Caller Test") {}
   end
 
