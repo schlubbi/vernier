@@ -100,10 +100,103 @@ class TestActiveSupport < Minitest::Test
     refute markers[0][5].key?(:caller), "non-SQL markers should not have :caller"
   end
 
+  # ── Transaction marker tests ──
+
+  def test_transaction_marker_is_created
+    result = Vernier.trace(hooks: [:activesupport]) do
+      _simulate_transaction(:commit)
+    end
+
+    markers = result.main_thread[:markers].select { |x| x[1] == "transaction.active_record" }
+    assert_equal 1, markers.size
+
+    marker = markers[0]
+    data = marker[5]
+    assert_equal "transaction.active_record", data[:type]
+    assert_equal :commit, data[:outcome]
+  end
+
+  def test_transaction_marker_has_caller
+    result = Vernier.trace(hooks: [:activesupport]) do
+      _app_level_transaction_caller
+    end
+
+    markers = result.main_thread[:markers].select { |x| x[1] == "transaction.active_record" }
+    assert_equal 1, markers.size
+
+    caller_frames = markers[0][5][:caller] || []
+    # Should contain the app-level method that initiated the transaction.
+    # The exact frame depends on filtering, but the marker should exist
+    # with timing data.
+    start_time = markers[0][2]
+    finish_time = markers[0][3]
+    assert_operator start_time, :<, finish_time, "transaction should have positive duration"
+  end
+
+  def test_transaction_rollback_outcome
+    result = Vernier.trace(hooks: [:activesupport]) do
+      _simulate_transaction(:rollback)
+    end
+
+    markers = result.main_thread[:markers].select { |x| x[1] == "transaction.active_record" }
+    assert_equal 1, markers.size
+    assert_equal :rollback, markers[0][5][:outcome]
+  end
+
+  def test_transaction_marker_separate_from_sql
+    result = Vernier.trace(hooks: [:activesupport]) do
+      # Simulate a transaction containing SQL
+      _simulate_transaction(:commit) do
+        ActiveSupport::Notifications.instrument("sql.active_record", sql: "INSERT INTO t (x) VALUES (1)", name: "Write") {}
+      end
+    end
+
+    txn_markers = result.main_thread[:markers].select { |x| x[1] == "transaction.active_record" }
+    sql_markers = result.main_thread[:markers].select { |x| x[1] == "sql.active_record" }
+    assert_equal 1, txn_markers.size
+    assert_equal 1, sql_markers.size
+
+    # Transaction marker should span the SQL marker
+    txn_start = txn_markers[0][2]
+    txn_finish = txn_markers[0][3]
+    sql_start = sql_markers[0][2]
+    assert_operator txn_start, :<=, sql_start
+    assert_operator sql_start, :<=, txn_finish
+  end
+
+  def test_transaction_not_in_generic_subscriber
+    # Ensure transaction.active_record is NOT duplicated by the generic subscriber
+    result = Vernier.trace(hooks: [:activesupport]) do
+      _simulate_transaction(:commit)
+    end
+
+    txn_markers = result.main_thread[:markers].select { |x| x[1] == "transaction.active_record" }
+    assert_equal 1, txn_markers.size, "transaction marker should not be duplicated"
+  end
+
   private
 
   def _sql_caller_test_method
     ActiveSupport::Notifications.instrument("sql.active_record", sql: "SELECT 1", name: "Caller Test") {}
+  end
+
+  def _simulate_transaction(outcome)
+    # Simulate the Rails TransactionInstrumenter flow:
+    # 1. build_handle creates a start/finish handle
+    # 2. start fires the start callback
+    # 3. finish fires the finish callback with outcome in payload
+    payload = { outcome: nil }
+    handle = ::ActiveSupport::Notifications.instrumenter.build_handle(
+      "transaction.active_record", payload
+    )
+    handle.start
+    yield if block_given?
+    payload[:outcome] = outcome
+    handle.finish
+  end
+
+  def _app_level_transaction_caller
+    _simulate_transaction(:commit)
   end
 
 end

@@ -142,6 +142,16 @@ module Vernier
           data: [
             { key: "initializer", format: "string" }
           ]
+        },
+        {
+          name: "transaction.active_record",
+          display: [ "marker-chart", "marker-table" ],
+          tooltipLabel: "transaction ({marker.data.outcome})",
+          chartLabel:   "transaction ({marker.data.outcome})",
+          tableLabel:   "Transaction ({marker.data.outcome})",
+          data: [
+            { key: "outcome", format: "string", searchable: true }
+          ]
         }
       ])
 
@@ -169,6 +179,8 @@ module Vernier
         /\bactive_support\/notifications/,  # AS::Notifications dispatch
         /\bactive_support\/subscriber/,
         /\bactive_support\/callbacks/,
+        /\bactive_record\/connection_adapters/,  # AR connection/transaction internals
+        /\bactive_record\/transactions/,
         /\bvernier\//,                  # Vernier itself
       ).freeze
 
@@ -176,51 +188,63 @@ module Vernier
         require "active_support"
         collector = @collector
 
-        # For sql.active_record: use an evented subscriber so we can capture
-        # the call stack in `start` (before SQL executes) rather than `finish`
-        # (after the stack has unwound). Uses caller_locations for accurate
-        # backtraces (rb_profile_frames/current_stack returns stale cfp entries
-        # in deep stacks).
-        sql_subscriber = Object.new
-        sql_subscriber.instance_variable_set(:@collector, collector)
-        sql_subscriber.instance_variable_set(:@pending, {})
-        sql_subscriber.define_singleton_method(:start) do |name, id, _payload|
-          locs = Kernel.caller_locations(2, 50)
-          caller_frames = []
-          locs&.each do |loc|
-            path = loc.absolute_path || loc.path || ""
-            next if EXCLUDED_PATH_RE.match?(path)
-            # Use relative path if under working directory
-            rel = path
-            caller_frames << "#{loc.label}  [#{rel}:#{loc.lineno}]"
-            break if caller_frames.size >= 8
+        # Build an evented subscriber that captures caller_locations at `start`
+        # time (before the instrumented block executes). This gives accurate
+        # application-level backtraces for both SQL queries and transactions.
+        build_caller_subscriber = ->(collector_ref) do
+          sub = Object.new
+          sub.instance_variable_set(:@collector, collector_ref)
+          sub.instance_variable_set(:@pending, {})
+          sub.define_singleton_method(:start) do |name, id, _payload|
+            locs = Kernel.caller_locations(2, 50)
+            caller_frames = []
+            locs&.each do |loc|
+              path = loc.absolute_path || loc.path || ""
+              next if EXCLUDED_PATH_RE.match?(path)
+              rel = path
+              caller_frames << "#{loc.label}  [#{rel}:#{loc.lineno}]"
+              break if caller_frames.size >= 8
+            end
+            @pending[id] = [
+              Process.clock_gettime(Process::CLOCK_MONOTONIC),
+              caller_frames
+            ]
           end
-          @pending[id] = [
-            Process.clock_gettime(Process::CLOCK_MONOTONIC),
-            caller_frames
-          ]
-        end
-        sql_subscriber.define_singleton_method(:finish) do |name, id, payload|
-          start_time, caller_frames = @pending.delete(id)
-          return unless start_time
-          finish_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          data = { type: name }
-          if keys = SERIALIZED_KEYS[name]
-            keys.each { |key| data[key] = payload[key] }
+          sub.define_singleton_method(:finish) do |name, id, payload|
+            start_time, caller_frames = @pending.delete(id)
+            return unless start_time
+            finish_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            data = { type: name }
+            if keys = SERIALIZED_KEYS[name]
+              keys.each { |key| data[key] = payload[key] }
+            end
+            data[:caller] = caller_frames if caller_frames && !caller_frames.empty?
+            @collector.add_marker(
+              name: name,
+              start: (start_time * 1_000_000_000.0).to_i,
+              finish: (finish_time * 1_000_000_000.0).to_i,
+              data: data
+            )
           end
-          data[:caller] = caller_frames if caller_frames && !caller_frames.empty?
-          @collector.add_marker(
-            name: name,
-            start: (start_time * 1_000_000_000.0).to_i,
-            finish: (finish_time * 1_000_000_000.0).to_i,
-            data: data
-          )
+          sub
         end
-        @sql_subscription = ::ActiveSupport::Notifications.subscribe("sql.active_record", sql_subscriber)
+
+        # sql.active_record: captures caller stack showing who issued the query
+        @sql_subscription = ::ActiveSupport::Notifications.subscribe(
+          "sql.active_record", build_caller_subscriber.call(collector)
+        )
+
+        # transaction.active_record: captures caller stack showing who opened
+        # the transaction. The stack is captured at materialization time (first
+        # SQL in the transaction), which still has the transaction do block on
+        # the call stack.
+        @txn_subscription = ::ActiveSupport::Notifications.subscribe(
+          "transaction.active_record", build_caller_subscriber.call(collector)
+        )
 
         # Everything else: block subscriber (no stack capture needed)
         @subscription = ::ActiveSupport::Notifications.monotonic_subscribe(/\A[^!]/) do |name, start, finish, id, payload|
-          next if name == "sql.active_record"
+          next if name == "sql.active_record" || name == "transaction.active_record"
           unless Float === start && Float === finish
             next
           end
@@ -240,8 +264,10 @@ module Vernier
       def disable
         ::ActiveSupport::Notifications.unsubscribe(@subscription)
         ::ActiveSupport::Notifications.unsubscribe(@sql_subscription)
+        ::ActiveSupport::Notifications.unsubscribe(@txn_subscription)
         @subscription = nil
         @sql_subscription = nil
+        @txn_subscription = nil
       end
 
       def firefox_marker_schema
