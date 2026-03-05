@@ -242,9 +242,21 @@ module Vernier
           "transaction.active_record", build_caller_subscriber.call(collector)
         )
 
+        # I/O events inside transactions: capture caller stacks so the analyzer
+        # can attribute enqueue/RPC calls to the code that initiated them,
+        # rather than conflating with the SQL caller stack.
+        io_events = %w[
+          enqueue.active_job
+          enqueue_at.active_job
+        ]
+        @io_subscriptions = io_events.map do |event|
+          ::ActiveSupport::Notifications.subscribe(event, build_caller_subscriber.call(collector))
+        end
+
         # Everything else: block subscriber (no stack capture needed)
+        caller_captured = (["sql.active_record", "transaction.active_record"] + io_events).to_h { |e| [e, true] }
         @subscription = ::ActiveSupport::Notifications.monotonic_subscribe(/\A[^!]/) do |name, start, finish, id, payload|
-          next if name == "sql.active_record" || name == "transaction.active_record"
+          next if caller_captured[name]
           unless Float === start && Float === finish
             next
           end
@@ -265,6 +277,7 @@ module Vernier
         ::ActiveSupport::Notifications.unsubscribe(@subscription)
         ::ActiveSupport::Notifications.unsubscribe(@sql_subscription)
         ::ActiveSupport::Notifications.unsubscribe(@txn_subscription)
+        @io_subscriptions&.each { |s| ::ActiveSupport::Notifications.unsubscribe(s) }
         @subscription = nil
         @sql_subscription = nil
         @txn_subscription = nil

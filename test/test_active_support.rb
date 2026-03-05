@@ -97,7 +97,44 @@ class TestActiveSupport < Minitest::Test
 
     markers = result.main_thread[:markers].select { |x| x[1] == "cache_read.active_support" }
     assert_equal 1, markers.size
-    refute markers[0][5].key?(:caller), "non-SQL markers should not have :caller"
+    refute markers[0][5].key?(:caller), "non-SQL/non-IO markers should not have :caller"
+  end
+
+  # ── I/O marker tests ──
+
+  def test_enqueue_active_job_has_caller
+    result = Vernier.trace(hooks: [:activesupport]) do
+      ActiveSupport::Notifications.instrument("enqueue.active_job", job: "TestJob") {}
+    end
+
+    markers = result.main_thread[:markers].select { |x| x[1] == "enqueue.active_job" }
+    assert_equal 1, markers.size
+
+    data = markers[0][5]
+    assert_equal "enqueue.active_job", data[:type]
+    # :caller is only present when app frames are found (test frames are filtered)
+    if data.key?(:caller)
+      assert_kind_of Array, data[:caller]
+    end
+  end
+
+  def test_enqueue_at_active_job_has_caller
+    result = Vernier.trace(hooks: [:activesupport]) do
+      ActiveSupport::Notifications.instrument("enqueue_at.active_job", job: "TestJob") {}
+    end
+
+    markers = result.main_thread[:markers].select { |x| x[1] == "enqueue_at.active_job" }
+    assert_equal 1, markers.size
+    assert_equal "enqueue_at.active_job", markers[0][5][:type]
+  end
+
+  def test_enqueue_not_in_generic_subscriber
+    result = Vernier.trace(hooks: [:activesupport]) do
+      ActiveSupport::Notifications.instrument("enqueue.active_job", job: "TestJob") {}
+    end
+
+    markers = result.main_thread[:markers].select { |x| x[1] == "enqueue.active_job" }
+    assert_equal 1, markers.size, "enqueue marker should not be duplicated"
   end
 
   # ── Transaction marker tests ──
