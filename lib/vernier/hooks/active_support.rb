@@ -245,18 +245,38 @@ module Vernier
         # I/O events inside transactions: capture caller stacks so the analyzer
         # can attribute enqueue/RPC calls to the code that initiated them,
         # rather than conflating with the SQL caller stack.
+        # ~6K markers per profile, ~189ms overhead from caller_locations.
         io_events = %w[
           enqueue.active_job
           enqueue_at.active_job
+          deliver.action_mailer
         ]
         @io_subscriptions = io_events.map do |event|
           ::ActiveSupport::Notifications.subscribe(event, build_caller_subscriber.call(collector))
         end
 
-        # Everything else: block subscriber (no stack capture needed)
-        caller_captured = (["sql.active_record", "transaction.active_record"] + io_events).to_h { |e| [e, true] }
+        # Pattern-based I/O subscriptions for RPC/external call families
+        io_patterns = [
+          /\Arpc\.client\./,        # rpc.client.spokes, rpc.client.*, etc.
+          /\Aremote_call\./,        # remote_call.gitrpc, etc.
+          /\Aauthzd?\.client\./,    # authzd.client.request.*, authz.client.*, etc.
+        ]
+        @io_pattern_subscriptions = io_patterns.map do |pattern|
+          ::ActiveSupport::Notifications.subscribe(pattern, build_caller_subscriber.call(collector))
+        end
+
+        # Everything else: block subscriber (no stack capture needed).
+        # Events handled by evented subscribers above are skipped here.
+        # Exact-name events are fast-checked via hash; pattern events are
+        # excluded by the AS subscription system (they won't double-fire
+        # for the same subscriber), but the monotonic_subscribe regex
+        # catches everything — so we skip known exact names here and rely
+        # on AS to not double-deliver pattern-matched events.
+        caller_captured_exact = (["sql.active_record", "transaction.active_record"] + io_events).to_h { |e| [e, true] }
+        caller_captured_patterns = io_patterns
         @subscription = ::ActiveSupport::Notifications.monotonic_subscribe(/\A[^!]/) do |name, start, finish, id, payload|
-          next if caller_captured[name]
+          next if caller_captured_exact[name]
+          next if caller_captured_patterns.any? { |p| p.match?(name) }
           unless Float === start && Float === finish
             next
           end
@@ -278,7 +298,12 @@ module Vernier
         ::ActiveSupport::Notifications.unsubscribe(@sql_subscription)
         ::ActiveSupport::Notifications.unsubscribe(@txn_subscription)
         @io_subscriptions&.each { |s| ::ActiveSupport::Notifications.unsubscribe(s) }
+        @io_pattern_subscriptions&.each { |s| ::ActiveSupport::Notifications.unsubscribe(s) }
         @subscription = nil
+        @sql_subscription = nil
+        @txn_subscription = nil
+        @io_subscriptions = nil
+        @io_pattern_subscriptions = nil
         @sql_subscription = nil
         @txn_subscription = nil
       end
