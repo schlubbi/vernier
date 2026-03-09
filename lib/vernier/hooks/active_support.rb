@@ -219,6 +219,14 @@ module Vernier
               keys.each { |key| data[key] = payload[key] }
             end
             data[:caller] = caller_frames if caller_frames && !caller_frames.empty?
+            # For SQL and transaction events, capture the connection class
+            # (e.g., "ApplicationRecord::IamAbilities") so the analyzer can
+            # attribute writes to the correct database cluster/domain.
+            if (name == "sql.active_record" || name == "transaction.active_record") &&
+               (conn = payload[:connection])
+              cc = conn.connection_class
+              data[:connection_class] = cc.name if cc
+            end
             @collector.add_marker(
               name: name,
               start: (start_time * 1_000_000_000.0).to_i,
